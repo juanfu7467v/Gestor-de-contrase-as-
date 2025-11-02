@@ -1,0 +1,21 @@
+# Nombre de la aplicación en Fly.io. Reemplaza 'nombre-de-tu-app' por el que desees.
+app = "nombre-de-tu-app"
+primary_region = "gru" # Reemplaza 'gru' por la región más cercana a ti (ej: 'sjc', 'iad', 'cdg', etc.)
+
+[build]
+  # Fly.io automáticamente detectará y usará el Dockerfile.
+
+[http_service]
+  # Escucha en el puerto 80/443 y lo redirige al puerto 3000 del contenedor (Exposed port).
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0 # Permite escalar a cero para ahorrar costos
+  processes = ["app"]
+
+[[vm]]
+  cpu_kind = "shared"
+  # Tipo de máquina más pequeña y económica
+  size = "1x"
+  memory = "256mb"

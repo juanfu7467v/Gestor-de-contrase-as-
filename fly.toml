@@ -16,6 +16,6 @@ primary_region = "gru" # Reemplaza 'gru' por la región más cercana a ti (ej: '
 
 [[vm]]
   cpu_kind = "shared"
-  # Tipo de máquina más pequeña y económica
-  size = "1x"
+  # CORRECCIÓN: El tamaño debe ser 'shared-cpu-1x' o similar.
+  size = "shared-cpu-1x"
   memory = "256mb"

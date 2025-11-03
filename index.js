@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import cors from "cors";
 import crypto from "crypto";
 import { URLSearchParams } from "url";
+import axios from "axios"; // 🚨 Nueva dependencia para GitHub
 
 dotenv.config();
 
@@ -21,6 +22,17 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
+
+// -------------------- VARIABLES DE ENTORNO REQUERIDAS --------------------
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_REPO = process.env.GITHUB_REPO; // Formato: 'usuario/repositorio'
+const GITHUB_OWNER = GITHUB_REPO ? GITHUB_REPO.split('/')[0] : 'owner';
+const GITHUB_REPO_NAME = GITHUB_REPO ? GITHUB_REPO.split('/')[1] : 'repo';
+
+// Validación básica de GitHub
+if (!GITHUB_TOKEN || !GITHUB_REPO) {
+    console.warn("⚠️ Advertencia: GITHUB_TOKEN o GITHUB_REPO no están configurados. El registro en GitHub será omitido.");
+}
 
 // -------------------- FIREBASE ADMIN SDK --------------------
 // Inicialización de Firebase
@@ -51,7 +63,7 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
-// -------------------- MOCK DE UTILERÍAS DE SEGURIDAD (E2E) --------------------
+// -------------------- UTILERÍAS DE SEGURIDAD Y CÓDIGO EXISTENTE --------------------
 
 /**
  * MOCK: Cifra un texto para simular E2E.
@@ -127,14 +139,45 @@ const calculateSecurityScore = (password) => {
     return { score, level, color };
 };
 
-// -------------------- GENERADOR AVANZADO --------------------
+// -------------------- GENERADOR AVANZADO Y ESPECÍFICO (Función 2. Generación de Contraseñas Específicas) --------------------
 /**
- * 🔐 Generador de contraseñas seguras y personalizables (Función 1)
+ * Lógica para adaptar la generación a servicios comunes.
+ * @param {string} serviceName - Nombre del servicio (ej: 'Email', 'SocialMedia', 'Bank').
+ * @returns {object} - Opciones de generación preestablecidas.
+ */
+const getServiceSpecificOptions = (serviceName) => {
+    switch (serviceName.toLowerCase()) {
+        case 'email':
+        case 'bank':
+            // Políticas estrictas: longitud mayor, todos los tipos
+            return { length: 20, includeSpecial: true, excludeLookalikes: true };
+        case 'socialmedia':
+            // Un poco más relajada en longitud, pero fuerte
+            return { length: 16, includeSpecial: true };
+        case 'ecommerce':
+            return { length: 14, includeSpecial: false };
+        default:
+            return { length: 16, includeSpecial: true }; // Por defecto
+    }
+};
+
+/**
+ * 🔐 Generador de contraseñas seguras y personalizables (Función 1 + 2. Generación Específica)
  * @param {number} length - Longitud de la contraseña.
  * @param {object} options - Opciones de generación.
+ * @param {string} serviceType - Tipo de servicio para aplicar reglas preestablecidas.
  * @returns {string} - Contraseña generada.
  */
-const generateSecurePasswordAdvanced = (length = 16, options = {}) => {
+const generateSecurePasswordAdvanced = (length = 16, options = {}, serviceType = null) => {
+    let finalOptions = { ...options };
+
+    // 🚨 Aplicar reglas específicas si se define un tipo de servicio.
+    if (serviceType) {
+        const serviceRules = getServiceSpecificOptions(serviceType);
+        length = serviceRules.length || length;
+        finalOptions = { ...finalOptions, ...serviceRules };
+    }
+
     const { 
         includeLower = true,
         includeUpper = true,
@@ -142,7 +185,7 @@ const generateSecurePasswordAdvanced = (length = 16, options = {}) => {
         includeSpecial = true,
         excludeLookalikes = true,
         passphrase = false // Función 18
-    } = options;
+    } = finalOptions;
 
     if (passphrase) {
         // MOCK: Generación de frases seguras (Passphrases - Función 18)
@@ -201,28 +244,127 @@ const generateSecurePasswordAdvanced = (length = 16, options = {}) => {
     return password.split('').sort(() => 0.5 - Math.random()).join('').substring(0, length);
 };
 
+// -------------------- LOG DE ACTIVIDAD Y GITHUB (Función 8. Historial de Cambios) --------------------
 
-// -------------------- LOG DE ACTIVIDAD --------------------
 /**
- * 🧾 Registra actividad del usuario (Función 9)
+ * 📂 Guarda el log de actividad en un archivo de GitHub.
+ * @param {string} userId - ID del usuario.
+ * @param {object} logEntry - Objeto de actividad.
+ */
+const saveToGitHub = async (userId, logEntry) => {
+    if (!GITHUB_TOKEN || !GITHUB_REPO) {
+        console.warn("⚠️ Omitiendo registro en GitHub: Variables de entorno faltantes.");
+        return;
+    }
+
+    const filePath = `public/${userId}_activity.json`;
+    const apiUrl = `https://api.github.com/repos/${GITHUB_REPO}/contents/${filePath}`;
+    const headers = {
+        Authorization: `token ${GITHUB_TOKEN}`,
+        'Content-Type': 'application/json',
+    };
+
+    let existingContent = [];
+    let sha = null;
+
+    try {
+        // 1. Intentar obtener el archivo existente
+        const response = await axios.get(apiUrl, { headers });
+        const contentBase64 = response.data.content;
+        sha = response.data.sha;
+        existingContent = JSON.parse(Buffer.from(contentBase64, 'base64').toString('utf8'));
+    } catch (error) {
+        // Si el archivo no existe (error 404), se ignora y existingContent se mantiene como []
+        if (error.response && error.response.status !== 404) {
+            console.error(`🔴 Error al leer archivo de GitHub para ${userId}:`, error.message);
+            // Si hay otro error, salimos para evitar la sobreescritura incorrecta.
+            return;
+        }
+    }
+
+    // 2. Añadir el nuevo registro
+    existingContent.push(logEntry);
+    
+    // 3. Preparar el contenido para subir (Base64)
+    const newContentBase64 = Buffer.from(JSON.stringify(existingContent, null, 2)).toString('base64');
+
+    try {
+        // 4. Subir el nuevo contenido
+        const commitMessage = `Historial de Cambios: ${logEntry.action} por el usuario ${userId}`;
+        const uploadData = {
+            message: commitMessage,
+            content: newContentBase64,
+            sha: sha // Necesario si es una actualización
+        };
+
+        await axios.put(apiUrl, uploadData, { headers });
+        console.log(`✅ Actividad de ${userId} guardada en GitHub: ${filePath}`);
+
+    } catch (error) {
+        console.error(`🔴 Error al subir el archivo a GitHub para ${userId}:`, error.response ? error.response.data : error.message);
+    }
+};
+
+
+/**
+ * 🧾 Registra actividad del usuario (Función 9 + 8. Historial de Cambios)
  * @param {string} userId - ID del usuario.
  * @param {string} action - Acción realizada (ej: 'ACCESS', 'UPDATE', 'LOGIN_FAIL').
  * @param {string} details - Detalles de la acción.
+ * @param {string} byUser - El usuario que realizó el cambio (para gestión de equipos).
  */
-const logActivity = async (userId, action, details) => {
+const logActivity = async (userId, action, details, byUser = userId) => {
+    const logEntry = {
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        action: action,
+        details: details,
+        ipAddress: 'MOCK_IP', 
+        success: action.includes('FAIL') ? false : true,
+        byUser: byUser, // 🚨 Nuevo campo para el historial de cambios/equipo
+    };
+
     try {
         const activityRef = db.collection('users').doc(userId).collection('activity');
-        await activityRef.add({
-            timestamp: admin.firestore.FieldValue.serverTimestamp(),
-            action: action,
-            details: details,
-            ipAddress: 'MOCK_IP', // En producción se obtendría del request.
-            success: action.includes('FAIL') ? false : true,
-        });
+        await activityRef.add(logEntry);
+        
+        // 🚨 Guardar el log en GitHub de forma asíncrona (Función 8)
+        const logEntryForGithub = {
+             ...logEntry,
+             timestamp: new Date().toISOString() // Usar ISO para GitHub
+        };
+        saveToGitHub(userId, logEntryForGithub);
+
     } catch (error) {
-        console.error("🔴 Error al registrar actividad:", error);
+        console.error("🔴 Error al registrar actividad en Firestore:", error);
     }
 };
+
+// -------------------- FUNCIONES DE SEGURIDAD AVANZADAS --------------------
+
+/**
+ * 🛡️ Envía alertas de seguridad al cliente (Función 5. Alertas de seguridad)
+ * Esta función es un MOCK de lo que el servidor podría enviar al cliente (e.g., por una notificación push).
+ * @param {string} userId - ID del usuario.
+ * @param {string} type - Tipo de alerta (e.g., 'WEAK_PASSWORD', 'SUSPICIOUS_LOGIN', 'REUSED_PASSWORD').
+ * @param {string} message - Mensaje detallado.
+ */
+const sendSecurityAlert = async (userId, type, message) => {
+    // En un sistema real, esto se integraría con un servicio de notificaciones Push (Firebase Cloud Messaging, etc.)
+    const alertData = {
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        type: type,
+        message: message,
+        read: false,
+    };
+    try {
+        await db.collection('users').doc(userId).collection('alerts').add(alertData);
+        await logActivity(userId, "SECURITY_ALERT_SENT", `Alerta de ${type}: ${message}`);
+        console.log(`🔔 Alerta de seguridad enviada a ${userId}: ${type}`);
+    } catch (error) {
+        console.error("🔴 Error al guardar alerta de seguridad:", error);
+    }
+};
+
 
 // -------------------- MIDDLEWARE --------------------
 
@@ -242,6 +384,8 @@ const authMiddleware = async (req, res, next) => {
 
     if (snapshot.empty) {
       await logActivity("unknown", "LOGIN_FAIL", `Intento de acceso con API Key inválida: ${token}`);
+      // 🚨 Simulación de alerta de inicio de sesión sospechoso (Función 5)
+      await sendSecurityAlert("unknown_user", "SUSPICIOUS_LOGIN", `Intento de acceso fallido con API Key: ${token}`);
       return res.status(403).json({ ok: false, error: "Token inválido o usuario no encontrado" });
     }
 
@@ -271,14 +415,15 @@ app.get("/", (req, res) => {
 });
 
 /**
- * GET /api/passwords/generate (Función 1)
- * Genera una contraseña o una frase segura (passphrase).
- * Query Params: length, includeLower, includeUpper, includeNumbers, includeSpecial, excludeLookalikes, passphrase
+ * GET /api/passwords/generate (Función 1 + 2. Generación Específica)
+ * Genera una contraseña o una frase segura (passphrase), opcionalmente para un servicio específico.
+ * Query Params: length, includeLower, includeUpper, includeNumbers, includeSpecial, excludeLookalikes, passphrase, serviceType
  */
 app.get("/api/passwords/generate", authMiddleware, (req, res) => {
     const { 
         length = 16, 
         passphrase = 'false',
+        serviceType = null, // 🚨 Nuevo parámetro para generación específica
         ...options 
     } = req.query;
     
@@ -300,15 +445,19 @@ app.get("/api/passwords/generate", authMiddleware, (req, res) => {
     }
 
     try {
-        const generatedPassword = generateSecurePasswordAdvanced(parsedLength, parsedOptions);
+        const generatedPassword = generateSecurePasswordAdvanced(parsedLength, parsedOptions, serviceType);
         const security = calculateSecurityScore(generatedPassword);
+
+        // 🚨 Registro de actividad
+        logActivity(req.user.id, "GENERATE", `Contraseña generada para ${serviceType || 'General'} (Score: ${security.score}).`);
 
         res.json({
             ok: true,
             message: `Contraseña generada.`,
             password: generatedPassword,
             security: security,
-            type: parsedOptions.passphrase ? "Passphrase" : "Password"
+            type: parsedOptions.passphrase ? "Passphrase" : "Password",
+            service: serviceType
         });
     } catch (error) {
         console.error("🔴 Error al generar contraseña:", error);
@@ -319,7 +468,7 @@ app.get("/api/passwords/generate", authMiddleware, (req, res) => {
 
 /**
  * GET /api/passwords/create (Función 1-2, 6, 8, 11)
- * Crea una nueva credencial (usando GET y query params, lo cual es MUY INSEGURO en la práctica).
+ * Crea una nueva credencial.
  * Query Params: name, username, password (el blob cifrado), url, category, notes, expiryDate
  */
 app.get("/api/passwords/create", authMiddleware, async (req, res) => {
@@ -330,9 +479,7 @@ app.get("/api/passwords/create", authMiddleware, async (req, res) => {
         return res.status(400).json({ ok: false, error: "Faltan campos obligatorios: name, username, password (cifrada)." });
     }
     
-    // En un sistema E2E real, el score se calcula en el cliente sobre el texto plano,
-    // o el cliente envía el score junto con el blob cifrado.
-    // Aquí desciframos el mock para calcular el score (para fines de demostración del score).
+    // Desciframos el mock para calcular el score (para fines de demostración del score).
     const decryptedMock = MOCK_DECRYPT(password);
     const security = calculateSecurityScore(decryptedMock);
     
@@ -438,6 +585,7 @@ app.get("/api/passwords/update/:id", authMiddleware, async (req, res) => {
 
     const docRef = db.collection('users').doc(req.user.id).collection('passwords').doc(passwordId);
     const updates = {};
+    let oldName = '';
     
     // Mapeo de query params a campos de Firestore, con validación/conversión
     if (updateData.isFavorite !== undefined) {
@@ -458,6 +606,11 @@ app.get("/api/passwords/update/:id", authMiddleware, async (req, res) => {
         updates.securityScore = security.score;
         updates.securityLevel = security.level;
         updates.securityColor = security.color;
+
+        // 🚨 Alerta de seguridad si la nueva contraseña es muy débil (Función 5)
+        if (security.score < 30) {
+            sendSecurityAlert(req.user.id, "WEAK_PASSWORD_ADDED", `La contraseña para ${updateData.name || 'una credencial'} es muy débil después de la actualización.`);
+        }
     }
 
     updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
@@ -467,9 +620,10 @@ app.get("/api/passwords/update/:id", authMiddleware, async (req, res) => {
         if (!doc.exists) {
             return res.status(404).json({ ok: false, error: "Credencial no encontrada." });
         }
+        oldName = doc.data().name; // Guardamos el nombre anterior para el log
 
         await docRef.update(updates);
-        await logActivity(req.user.id, "UPDATE", `Credencial ${doc.data().name} (${passwordId}) actualizada.`);
+        await logActivity(req.user.id, "UPDATE", `Credencial ${oldName} (${passwordId}) actualizada. Campos: ${Object.keys(updates).join(', ')}.`, req.user.id);
 
         res.json({ 
             ok: true, 
@@ -500,7 +654,7 @@ app.get("/api/passwords/delete/:id", authMiddleware, async (req, res) => {
         }
 
         await docRef.delete();
-        await logActivity(req.user.id, "DELETE", `Credencial ${doc.data().name} (${passwordId}) eliminada.`);
+        await logActivity(req.user.id, "DELETE", `Credencial ${doc.data().name} (${passwordId}) eliminada.`, req.user.id);
 
         res.json({ 
             ok: true, 
@@ -542,6 +696,9 @@ app.get("/api/passwords/search", authMiddleware, async (req, res) => {
             pass.category?.toLowerCase().includes(searchTerm) ||
             pass.username?.toLowerCase().includes(searchTerm)
         );
+        
+        await logActivity(req.user.id, "SEARCH", `Búsqueda de '${searchTerm}' - ${results.length} resultados.`);
+
 
         res.json({
             ok: true,
@@ -558,27 +715,25 @@ app.get("/api/passwords/search", authMiddleware, async (req, res) => {
 
 
 /**
- * GET /api/security/audit (Función 12, 19)
- * Revisa contraseñas débiles o repetidas. Genera el Panel de Seguridad.
+ * GET /api/security/audit (Función 5. Alertas, 6. Análisis Avanzado, 12, 19)
+ * Revisa contraseñas débiles, repetidas y patrones. Genera el Panel de Seguridad.
  */
 app.get("/api/security/audit", authMiddleware, async (req, res) => {
     try {
         const passwordsRef = db.collection('users').doc(req.user.id).collection('passwords');
         const snapshot = await passwordsRef.get();
         
-        const passwords = snapshot.docs.map(doc => doc.data());
+        const passwords = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 
         const weakPasswords = [];
         const repeatedPasswords = [];
-        const passwordCount = {}; // Para detectar repeticiones
+        const passwordCount = {}; 
+        const patternDetection = []; // 🚨 Para Función 6
 
         // Auditoría
         for (const pass of passwords) {
-            // Se asume que en el servidor solo tenemos el BLOB cifrado. 
-            // Para fines de auditoría, se usa el MOCK DECRYPT para obtener la 'contraseña plana'
-            // En un sistema real, el cliente realiza esta auditoría.
             const decryptedPass = MOCK_DECRYPT(pass.password);
-
+            
             // 1. Revisión de debilidad (score < 50)
             if (pass.securityScore < 50) {
                 weakPasswords.push({
@@ -588,14 +743,36 @@ app.get("/api/security/audit", authMiddleware, async (req, res) => {
                     level: pass.securityLevel,
                     reason: "Contraseña débil (Score bajo)."
                 });
+                // 🚨 Generar alerta (Función 5)
+                sendSecurityAlert(req.user.id, "WEAK_PASSWORD", `La contraseña para ${pass.name} es débil.`);
             }
 
             // 2. Revisión de repetición
             if (passwordCount[decryptedPass]) {
                 passwordCount[decryptedPass].count += 1;
                 passwordCount[decryptedPass].names.push(pass.name);
+                // 🚨 Generar alerta (Función 5)
+                if (passwordCount[decryptedPass].count === 2) {
+                    sendSecurityAlert(req.user.id, "REUSED_PASSWORD", `La contraseña para ${pass.name} está repetida.`);
+                }
             } else {
                 passwordCount[decryptedPass] = { count: 1, names: [pass.name] };
+            }
+
+            // 3. 🚨 Análisis Avanzado: Detección de patrones simples (Función 6)
+            if (decryptedPass.includes(pass.username) && pass.username.length > 3) {
+                 patternDetection.push({
+                    id: pass.id,
+                    name: pass.name,
+                    reason: "Contiene el nombre de usuario."
+                });
+            }
+            if (/(123|abc|qwerty)/i.test(decryptedPass)) {
+                 patternDetection.push({
+                    id: pass.id,
+                    name: pass.name,
+                    reason: "Contiene secuencia común/palabra prohibida."
+                });
             }
         }
 
@@ -626,17 +803,21 @@ app.get("/api/security/audit", authMiddleware, async (req, res) => {
             medium: medium,
             weak: weak,
             repeatedCount: repeatedPasswords.length,
+            patternCount: patternDetection.length, // 🚨 Nuevo para Función 6
             securityScoreAverage: Math.round(securityScoreAverage),
-            securityRating: calculateSecurityScore(securityScoreAverage.toFixed(0)).level // Usamos el score del promedio
+            securityRating: calculateSecurityScore(securityScoreAverage.toFixed(0)).level 
         };
+
+        await logActivity(req.user.id, "SECURITY_AUDIT", "Auditoría de seguridad ejecutada.");
 
 
         res.json({
             ok: true,
-            message: "Auditoría de seguridad completada.",
+            message: "Auditoría de seguridad completada. Revise los hallazgos.",
             panel: panel,
             weakPasswords: weakPasswords,
-            repeatedPasswords: repeatedPasswords
+            repeatedPasswords: repeatedPasswords,
+            advancedPatternDetection: patternDetection // 🚨 Resultados Función 6
         });
 
     } catch (error) {
@@ -647,7 +828,7 @@ app.get("/api/security/audit", authMiddleware, async (req, res) => {
 
 
 /**
- * GET /api/activity (Función 9)
+ * GET /api/activity (Función 9 + 8. Historial de Cambios)
  * Obtiene el registro de actividad del usuario.
  */
 app.get("/api/activity", authMiddleware, async (req, res) => {
@@ -675,8 +856,259 @@ app.get("/api/activity", authMiddleware, async (req, res) => {
 });
 
 
+// -------------------- FUNCIONES ADICIONALES DE SEGURIDAD Y COMPARTIR --------------------
+
+/**
+ * GET /api/sync/status (Función 4. Sincronización entre dispositivos)
+ * Reporta el estado de sincronización y el último dispositivo sincronizado.
+ * Query Params: deviceId, deviceType
+ */
+app.get("/api/sync/status", authMiddleware, async (req, res) => {
+    const { deviceId, deviceType } = req.query;
+
+    if (!deviceId || !deviceType) {
+         return res.status(400).json({ ok: false, error: "Faltan parámetros: deviceId, deviceType." });
+    }
+
+    const syncInfo = {
+        lastSync: new Date().toISOString(),
+        lastDevice: `${deviceType} (${deviceId})`,
+        status: "OK",
+    };
+
+    try {
+        // Simular la actualización de un registro de sincronización
+        await db.collection('users').doc(req.user.id).update({
+            lastSync: syncInfo.lastSync,
+            lastDevice: syncInfo.lastDevice,
+        });
+        
+        await logActivity(req.user.id, "SYNC_UPDATE", `Dispositivo ${deviceType} (${deviceId}) sincronizado.`);
+
+        res.json({
+            ok: true,
+            message: "Estado de sincronización reportado y actualizado.",
+            syncInfo: syncInfo
+        });
+    } catch (error) {
+        console.error("🔴 Error al actualizar estado de sincronización:", error);
+        res.status(500).json({ ok: false, error: "Error interno al actualizar el estado de sincronización." });
+    }
+});
+
+
+/**
+ * GET /api/security/protection (Función 2. Autenticación Biométrica, 3. Análisis de Malware, 4. Protección contra phishing)
+ * Reporta el estado de las protecciones del cliente (MOCK/Informativo).
+ * Query Params: checkBiometric, checkMalware, checkPhishing
+ */
+app.get("/api/security/protection", authMiddleware, async (req, res) => {
+    const { checkBiometric, checkMalware, checkPhishing } = req.query;
+
+    const protectionStatus = {};
+
+    // 🚨 Autenticación Biométrica (Función 2. Seguridad Adicional)
+    if (checkBiometric === 'true') {
+        // El servidor verifica si la clave biométrica está habilitada en la cuenta
+        protectionStatus.biometricEnabled = req.user.biometricKeyId ? true : false; 
+    }
+
+    // 🚨 Análisis de Malware (Función 3. Seguridad Adicional)
+    if (checkMalware === 'true') {
+        // El servidor recibe el reporte de riesgo de malware del cliente
+        protectionStatus.malwareThreats = Math.random() < 0.1 ? 1 : 0; // MOCK de detección de amenaza
+        if (protectionStatus.malwareThreats > 0) {
+            sendSecurityAlert(req.user.id, "MALWARE_DETECTED", "Amenaza de malware detectada en el dispositivo.");
+        }
+    }
+
+    // 🚨 Protección contra Phishing (Función 4. Seguridad Adicional)
+    if (checkPhishing === 'true') {
+        // MOCK: El cliente puede enviar la URL para una verificación de reputación
+        protectionStatus.phishingProtection = {
+             status: "Active",
+             lastCheck: new Date().toISOString()
+        };
+    }
+    
+    await logActivity(req.user.id, "SECURITY_CHECK", "Revisión de protecciones de seguridad.");
+
+    res.json({
+        ok: true,
+        message: "Estado de protección de seguridad reportado.",
+        protectionStatus: protectionStatus
+    });
+});
+
+
+/**
+ * GET /api/share/password/:id (Función 1. Compartir contraseñas)
+ * Crea un enlace de compartición segura con permisos y vencimiento.
+ * Query Params: targetUserEmail, expirationDate, readOnly
+ */
+app.get("/api/share/password/:id", authMiddleware, async (req, res) => {
+    const passwordId = req.params.id;
+    const { targetUserEmail, expirationDate, readOnly = 'true' } = req.query;
+
+    if (!targetUserEmail || !expirationDate) {
+        return res.status(400).json({ ok: false, error: "Faltan parámetros: targetUserEmail, expirationDate." });
+    }
+
+    try {
+        const docRef = db.collection('users').doc(req.user.id).collection('passwords').doc(passwordId);
+        const doc = await docRef.get();
+        if (!doc.exists) {
+            return res.status(404).json({ ok: false, error: "Credencial no encontrada." });
+        }
+
+        // 1. Encontrar el ID del usuario objetivo
+        const targetSnapshot = await db.collection("users").where("email", "==", targetUserEmail).limit(1).get();
+        if (targetSnapshot.empty) {
+            return res.status(404).json({ ok: false, error: "Usuario objetivo no encontrado." });
+        }
+        const targetUserId = targetSnapshot.docs[0].id;
+
+        // 2. Crear el registro de compartición segura
+        const shareToken = crypto.randomBytes(16).toString('hex'); // Token seguro
+        const shareRecord = {
+            ownerId: req.user.id,
+            targetId: targetUserId,
+            passwordId: passwordId,
+            passwordBlob: doc.data().password, // Compartimos el blob cifrado E2E original
+            sharedAt: admin.firestore.FieldValue.serverTimestamp(),
+            expiresAt: new Date(expirationDate),
+            readOnly: readOnly === 'true',
+            active: true,
+        };
+
+        await db.collection('shares').doc(shareToken).set(shareRecord);
+        
+        const credentialName = doc.data().name;
+        await logActivity(req.user.id, "SHARE_PASSWORD", `Contraseña '${credentialName}' compartida con ${targetUserEmail}.`, req.user.id);
+
+
+        // 3. Crear el enlace de compartición (MOCK)
+        const shareLink = `${req.protocol}://password-manager-api/api/share/access?token=${shareToken}`;
+
+        res.json({
+            ok: true,
+            message: `Contraseña '${credentialName}' compartida de forma segura con ${targetUserEmail}.`,
+            shareLink: shareLink,
+            shareToken: shareToken
+        });
+
+    } catch (error) {
+        console.error("🔴 Error al compartir contraseña:", error);
+        res.status(500).json({ ok: false, error: "Error interno al compartir la contraseña." });
+    }
+});
+
+// -------------------- FUNCIONES DE GESTIÓN DE EQUIPOS --------------------
+
+/**
+ * GET /api/team/add-member (Función 2. Gestión de equipos)
+ * Permite a un administrador añadir un nuevo miembro al equipo.
+ * Query Params: memberEmail, role (admin/member), teamId (asumimos que el admin ya está autenticado)
+ */
+app.get("/api/team/add-member", authMiddleware, async (req, res) => {
+    // 🚨 Se asume que req.user tiene un campo 'role' (e.g., 'teamAdmin' o 'user')
+    if (req.user.role !== 'admin' && req.user.role !== 'teamAdmin') {
+        return res.status(403).json({ ok: false, error: "Acceso denegado. Solo administradores de equipo pueden añadir miembros." });
+    }
+
+    const { memberEmail, role = 'member', teamId } = req.query;
+
+    if (!memberEmail || !teamId) {
+        return res.status(400).json({ ok: false, error: "Faltan parámetros: memberEmail, teamId." });
+    }
+
+    try {
+        // MOCK: Buscar el usuario por email.
+        const targetSnapshot = await db.collection("users").where("email", "==", memberEmail).limit(1).get();
+        if (targetSnapshot.empty) {
+            return res.status(404).json({ ok: false, error: "Usuario a añadir no encontrado." });
+        }
+        const memberId = targetSnapshot.docs[0].id;
+        
+        // 1. Actualizar el perfil del miembro con el teamId y rol
+        await db.collection('users').doc(memberId).update({
+            teamId: teamId,
+            teamRole: role,
+        });
+        
+        // 2. Añadir al miembro a la lista del equipo (para una búsqueda rápida)
+        await db.collection('teams').doc(teamId).collection('members').doc(memberId).set({
+            email: memberEmail,
+            role: role,
+            joinedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        
+        // 3. 🚨 Notificación de equipo (Función 3. Notificaciones de equipo)
+        const teamNotification = {
+            type: "MEMBER_ADDED",
+            message: `${memberEmail} ha sido añadido al equipo con el rol: ${role}.`,
+            adminId: req.user.id,
+            timestamp: admin.firestore.FieldValue.serverTimestamp()
+        };
+        await db.collection('teams').doc(teamId).collection('notifications').add(teamNotification);
+
+
+        await logActivity(req.user.id, "TEAM_ADD_MEMBER", `Miembro ${memberEmail} añadido al equipo ${teamId} con rol ${role}.`, req.user.id);
+
+        res.json({
+            ok: true,
+            message: `Miembro ${memberEmail} añadido a ${teamId} con éxito.`
+        });
+
+    } catch (error) {
+        console.error("🔴 Error al añadir miembro al equipo:", error);
+        res.status(500).json({ ok: false, error: "Error interno al añadir miembro al equipo." });
+    }
+});
+
+
+/**
+ * GET /api/team/notifications (Función 3. Notificaciones de equipo)
+ * Permite a un administrador de equipo ver las notificaciones del equipo.
+ * Query Params: teamId
+ */
+app.get("/api/team/notifications", authMiddleware, async (req, res) => {
+    // 🚨 Se verifica que el usuario es un administrador de un equipo.
+    const teamId = req.query.teamId || req.user.teamId;
+    
+    if (!teamId || (req.user.teamId !== teamId || req.user.teamRole !== 'admin')) {
+         return res.status(403).json({ ok: false, error: "Acceso denegado. No es un administrador del equipo especificado." });
+    }
+
+    try {
+        const notificationsRef = db.collection('teams').doc(teamId).collection('notifications');
+        const snapshot = await notificationsRef.orderBy('timestamp', 'desc').limit(20).get();
+
+        const notifications = snapshot.docs.map(doc => ({
+            id: doc.id,
+            ...doc.data(),
+            timestamp: doc.data().timestamp ? doc.data().timestamp.toDate().toISOString() : 'N/A'
+        }));
+        
+        await logActivity(req.user.id, "TEAM_VIEW_NOTIFS", `Revisó ${notifications.length} notificaciones del equipo ${teamId}.`);
+
+        res.json({
+            ok: true,
+            message: `Mostrando las últimas ${notifications.length} notificaciones para el equipo ${teamId}.`,
+            count: notifications.length,
+            notifications: notifications
+        });
+
+    } catch (error) {
+        console.error("🔴 Error al obtener notificaciones de equipo:", error);
+        res.status(500).json({ ok: false, error: "Error interno al obtener notificaciones del equipo." });
+    }
+});
+
+
 // -------------------- SERVER --------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Servidor de Password Manager API corriendo en http://localhost:${PORT}`);
 });
+
